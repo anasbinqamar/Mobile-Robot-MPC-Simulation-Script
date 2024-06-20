@@ -1,0 +1,365 @@
+#!/usr/bin/env python
+"""
+Path tracking using NMPC for "forklift" kinematic robot 
+
+Ref:
+    - "Model Predictive Motion Control of Autonomous Forklift Vehicles with Dynamics Balance Constraint"
+    - https://github.com/hai-zhu/solver_test
+    - https://github.com/tomcattiger1230/ACADOS_Example
+"""
+
+# General imports
+import rospy
+import math
+import tf2_ros
+import tf2_geometry_msgs
+import numpy as np
+import time
+import array as arr
+from datetime import datetime
+
+# import matplotlib.pyplot as plt
+
+# ROS messages
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
+from pedsim_msgs.msg import AgentState, AgentStates
+from pedsim_msgs.msg import AgentGroup, AgentGroups
+
+# custom functions
+import libs.maths.quaternions as custom_quat
+import libs.models.farida_model as farida
+
+# Casadi 
+import casadi as ca
+from casadi import sin, cos, pi
+
+# =========================================================================
+# Utility function(s)
+# =========================================================================
+# get current time 
+def current_milli_time():
+    return round(time()*1000)
+
+# convert casadi.DM to np array
+def DM2Arr(dm):
+    return np.array(dm.full())
+
+
+"""
+Controller Class
+The MPC loop is at the end of the constructor.
+"""
+class my_controller:
+    """
+    Class Constructor
+    """
+    def __init__(self):
+    
+        # Target point
+        self.target_pose = np.array([12, 8, 0]) #1,1,0
+        
+        # Init state
+        self.x = 0 # [m]
+        self.y = 0 # [m]
+        self.yaw = 0 # [rad], orientation of the robot
+        self.current_pose = np.array([self.x, self.y, self.yaw])
+        self.alpha = 0 # [rad], orientation of the steering wheel
+        
+        #Obstacle
+        self.obstacle = [-9, -9]
+        
+        # inputs
+        self.v = 0 # [m/s], speed of the driving wheel 
+        self.w = 0 # [rad/s], angular velocity of the steering wheel
+        
+        
+        # MPC Settings 
+        self.dt = 0.1
+        self.N = 20
+        self.v_max = 1
+        self.v_min = -self.v_max
+        self.alpha_max = 60*math.pi/180.0
+        self.alpha_min = -self.alpha_max
+        self.n_states = 0
+        self.n_controls = 0
+        
+        #Tf2 Listener
+        self.tf_Buffer = tf2_ros.Buffer()
+        self.listener = tf2_ros.TransformListener(self.tf_Buffer) #listen and store in tf_Buffer
+        
+        # ROS interfaces
+       # rospy.Subscriber('odom', Odometry, self.odom_callback)
+       
+        self.human_data = None
+        self.human_detected = False
+        #Subscribers
+        self.human_state = rospy.Subscriber("/pedsim_simulator/simulated_agents", AgentStates, self.human_detect) #human data
+        #Publishers
+        self.cmd_pub = rospy.Publisher("/pedsim_lrs/control/cmd_vel",Twist,queue_size=1)
+        self.pred_pub = rospy.Publisher('predicted_path',MarkerArray, queue_size=2)    
+
+        # create MPC solver 
+        print("[my_controller]: Setting up MPC solver...")
+        self.create_solver()
+
+        # initialize state and input sequnces
+        U0 = ca.DM.zeros((self.n_controls, self.N))
+        state_init = ca.DM([self.x, self.y, self.yaw])
+        X0 = ca.repmat(state_init, 1, self.N+1)  #copies initial condition throughout X's columns
+        # enter loop for control
+        rate = rospy.Rate(10) # Hz
+        loop_counter = 0
+        print("[my_controller]: Starting MPC loop at 10 Hz!")
+        while not rospy.is_shutdown():
+            #Calculate Current Pose
+            self.tfCallBack()
+            #if ca.norm_2(self.current_pose - self.target_pose) > 1e-1 and loop_counter < 500: # stopping criterion for the control
+            if(True):
+                loop_counter += 1
+                #Human Data
+                if(self.human_detected == True):
+                    self.obstacle = [self.human_data.agent_states[0].pose.position.x, self.human_data.agent_states[0].pose.position.y]
+                    print("Obstacle At: ", self.obstacle)
+                print("Loop ", loop_counter, ", x: ", "{:3.2f}".format(self.x) , ", y: ", "{:3.2f}".format(self.y), "theta: ", "{:3.2f}".format(self.yaw*180.0/math.pi))
+                # update current position in the paramter list + ALSO: the obstacle now!
+                self.args['p'] = ca.vertcat(
+                    self.current_pose, 
+                    self.target_pose,
+                    self.obstacle
+                )
+                self.args['x0'] = ca.vertcat(
+                    ca.reshape(X0, self.n_states*(self.N+1),1), 
+                    ca.reshape(U0, self.n_controls*self.N, 1)
+                )
+                # udpate and run solver
+                tic = time.time()
+                sol = self.solver(
+                    x0 = self.args['x0'],
+                    lbx = self.args['lbx'],
+                    ubx = self.args['ubx'],
+                    lbg = self.args['lbg'],
+                    ubg = self.args['ubg'],
+                    p = self.args['p']
+                )
+                mpc_solve_time = time.time() - tic
+                # get results
+                u = ca.reshape(sol['x'][self.n_states*(self.N+1):], self.n_controls, self.N)
+                
+                # update input vector and state vector for next mpc step
+                # TODO: case study for infeasible solution (see sovler_test repo)
+                U0 = ca.horzcat(u[:, 1:], ca.reshape(u[:, -1], -1, 1))
+                X0 = ca.reshape(sol['x'][:self.n_states*(self.N+1)], self.n_states, self.N+1)
+                
+                # retrieve control inputs
+                cmd_out = DM2Arr(u[:,0])
+                move_cmd = Twist()
+                move_cmd.linear.x = cmd_out[0] # 
+                move_cmd.angular.z = cmd_out[1] # 
+                self.cmd_pub.publish(move_cmd)            
+                print("MPC Solver time used: ", mpc_solve_time, "s.")
+                print("Publish command: vel: ", "{:10.2f}".format(float(cmd_out[0])), "m/s, ", "{:10.2f}".format(float(cmd_out[1])*180.0/math.pi))
+                # TODO: publish predicted trajectory data as marker array
+                print("=================")
+            else:
+                print("Target reached! stopping the robot.")
+                move_cmd = Twist()
+                move_cmd.linear.x = 0 # 
+                move_cmd.angular.z = 0 # 
+                self.cmd_pub.publish(move_cmd)     
+                break
+            rate.sleep()
+    """
+    create_solver: generate MPC solver
+    """
+    def create_solver(self):
+        # weighting factors
+        Q_x = 1 #1000
+        Q_y = 1 #1000
+        Q_theta = 0 #200
+        R_v = 1
+        R_alpha = 10
+        # target pose
+        """ 
+        x_target = 3
+        y_target = 3
+        theta_target = 45/180.0*math.pi
+        self.target_pose = np.array([x_target, y_target, theta_target]) 
+        """
+        # obstacles
+        x_ob1 = self.obstacle[0]
+        y_ob1 = self.obstacle[1]
+        # safety distance
+        safety_distance = 2
+
+        # state symbolic variables
+        x = ca.SX.sym('x')
+        y = ca.SX.sym('y')
+        theta = ca.SX.sym('theta')
+        states = ca.vertcat(x,y,theta)  #State Vector
+        n_states = states.numel()
+        self.n_states = n_states
+        # control symbolic variables
+        vel = ca.SX.sym('v') # [m/s] velocity of the driving wheel
+        alpha = ca.SX.sym('alpha') # [rad] angle of the steering wheel (right: positive)
+        controls = ca.vertcat(vel, alpha)  #Input Vector
+        n_controls = controls.numel()
+        self.n_controls = n_controls
+        # Matric containing all states/control actions over all time steps
+        X = ca.SX.sym('X', n_states, self.N+1) # creates a matrix of shape n_states * (N+1)
+        U = ca.SX.sym('U', n_controls, self.N)
+        # parameter vector for initial and target state [6x1] - also adding obstacles! (now 9 elements)
+        P = ca.SX.sym('P', 2*n_states + len(self.obstacle))
+        # state weights matrix
+        Q = ca.diagcat(Q_x, Q_y, Q_theta) #3x3 diagonal matrix
+        # contorl weight matrix
+        R = ca.diagcat(R_v, R_alpha) #2x2 diagonal matrix
+
+        # kinematic equation RHS (right hand side)
+        kinematic_rhs = ca.vertcat(vel * ca.cos(theta)*ca.cos(alpha), 
+                                vel * ca.sin(theta)*ca.cos(alpha), 
+                                vel * ca.sin(alpha)/farida.robot_length) 
+        f = ca.Function('f',[states, controls], [kinematic_rhs]) #[states, controls] is the input, [kinematic_rhs] the output [Print(f) would return values generated by kinematic_rhs, a 3x1 vector, which happens to be x_k+1 y_k+1 and theta_k+1 (i.e.: next state X_k+1) if multiplied by dt (for a simple approx - here however we're using RK4 to discretise it)!]
+
+        # Construct cost function
+        # inicialize cost object (scalar) and constraint vector
+        cost_fn = 0
+        g = X[:, 0] - P[:n_states] #counts till 1 before P[n_states] (This is for MULTIPLE SHOOTING, where g has the constraint that the optimization variable X (which is general) correspond to predicted value of X based on RHS Kinematic eq!). Here it's storing the intial position of robot using the parameter b/c they can be updated in recursion even after the NLP setup
+
+        for k in range(self.N): #range(n) => 0 to N-1
+            # prediction of obstacle trajectory using cosntant velocity assumption
+            # sum up the cost function using current state
+            st = X[:, k]
+            con = U[:,k]
+            cost_fn = cost_fn \
+            + ca.mtimes(ca.mtimes((st- P[n_states:2*n_states]).T, Q), (st-P[n_states:2*n_states])) + ca.mtimes(ca.mtimes(con.T, R), con) #"3:" means count from index 3 till end
+            st_next = X[:, k+1]
+            # update the system state for next time step
+            # use RK4 to discretize the nonlinear kinematics
+            k1 = f(st, con)
+            k2 = f(st + k1*self.dt/2, con)
+            k3 = f(st + k2*self.dt/2, con)
+            k4 = f(st + k3*self.dt, con)
+            st_next_rk4 = st + (self.dt/6) * (k1 + 2*k2 + 2*k3 + k4) # X(k+1) is generated here as X(k+1) = X(k) + dt*rhs (Euler discrete, here rk4!)
+            g = ca.vertcat(g, st_next - st_next_rk4) #add more constraints for Multiple shooting, st_next is generalized X, an optimzation variable, while st_next_rk4 will be a calculated
+            # variable once the values are in - see above (g has n_states*N+1 elements so far when this loop ends - further collision avoidance constrains will be added)
+
+        # cost func for obstacle avoidance
+        for j in range (self.N+1):
+            dist_ob1 = (P[2*n_states] - X[0,j]) * (P[2*n_states]-X[0,j])  + (P[2*n_states+1]-X[1,j])*(P[2*n_states+1]-X[1,j])
+            g = ca.vertcat(g, safety_distance*safety_distance - dist_ob1) #g now has another N+1 elements appended, a total of 4 x (N+1) elements now are in it.
+        # rshape the batched matrix to column vector
+        OPT_variables = ca.vertcat(
+            X.reshape((-1,1)),
+            U.reshape((-1,1))
+        )
+
+        nlp_prob = { #NLP tries to minimize 'f' using decision variables 'x' with parameter vec 'p' and some constraints 'g' - it also takes in upper and lower bounds for 'x' and 'g' (note: 'x' is a concatenation of all decision variables, in this case both U and X). ubx, ubg, lbx, lbg are fed into the solver function at evaluation, along with x0, the initial values for decision variables!
+            'f': cost_fn,
+            'x': OPT_variables,
+            'g': g,
+            'p': P
+        }
+
+        opts = {
+            'ipopt':{
+                'max_iter': 200,
+                'print_level': 0,
+                'acceptable_tol': 1e-8,
+                'acceptable_obj_change_tol': 1e-6
+            },
+            'print_time': 0
+        }
+        self.solver = ca.nlpsol('solver', 'ipopt', nlp_prob, opts) #Defining the solver function which you'll need to call!
+
+        # Constraints
+        # "x" constraints: states + controls for the prediction horizon
+        lbx = ca.DM.zeros((n_states*(self.N+1) + n_controls*self.N, 1))
+        ubx = ca.DM.zeros((n_states*(self.N+1) + n_controls*self.N, 1))
+        # "g" constraints: dynamic constriants + colision avoidance (The is an initialization with zeros, where 3xN+1 elements are set for the equality constraint for traj tracking and the rest N+1 will have their lower bounds changed to -inf while upper bounds are already zero)
+        lbg = ca.DM.zeros((n_states*(self.N+1) + (self.N+1), 1))
+        ubg = ca.DM.zeros((n_states*(self.N+1) + (self.N+1),1))
+        # Set bounds to the constraints
+        lbx[0: n_states*(self.N+1): n_states] = -ca.inf # x lower bound
+        lbx[1: n_states*(self.N+1): n_states] = -ca.inf # Y lower bound
+        lbx[2: n_states*(self.N+1): n_states] = -ca.inf # theta lower bound
+
+        ubx[0: n_states*(self.N+1): n_states] = ca.inf # x upper bound
+        ubx[1: n_states*(self.N+1): n_states] = ca.inf # Y upper bound
+        ubx[2: n_states*(self.N+1): n_states] = ca.inf # theta upper bound
+
+        num_total_states = n_states*(self.N+1) + n_controls*self.N
+        # driving wheel constraint
+        lbx[n_states*(self.N+1):num_total_states:n_controls] = self.v_min
+        ubx[n_states*(self.N+1):num_total_states:n_controls] = self.v_max
+        # steering wheel constraint
+        lbx[n_states*(self.N+1)+1:num_total_states:n_controls] = self.alpha_min
+        ubx[n_states*(self.N+1)+1:num_total_states:n_controls] = self.alpha_max
+
+        # collision avoidance
+        lbg[n_states*(self.N+1):] = -ca.inf  #setting lower bounds for obstacle avoiding elements to -inf (the upper bound 0 corresponds with a traj. point at the border of safety distance from obs)
+
+        self.args = {
+            'lbg': lbg, # constraints lower bound
+            'ubg': ubg, 
+            'lbx': lbx,
+            'ubx': ubx
+        }
+    """
+    odom_callback: save the subscribed data to local variables
+    
+    def odom_callback(self, data):
+        self.x = data.pose.pose.position.x
+        self.y = data.pose.pose.position.y
+
+        qx = data.pose.pose.orientation.x
+        qy = data.pose.pose.orientation.y 
+        qz = data.pose.pose.orientation.z
+        qw = data.pose.pose.orientation.w
+        [roll, pitch, yaw] = custom_quat.euler_from_quaternion(qx, qy, qz, qw)
+        self.yaw = yaw
+        self.current_pose = np.array([self.x, self.y, self.yaw])
+    
+    """"""
+    TF2 Listener for getting robot pose data
+    """    
+    def tfCallBack(self):
+        try:
+            trans = self.tf_Buffer.lookup_transform("odom", "base_footprint", rospy.Time()) #get odom wrt base at time T
+            self.x = trans.transform.translation.x
+            self.y = trans.transform.translation.y
+            self.yaw = custom_quat.euler_from_quaternion(
+            trans.transform.rotation.x,
+            trans.transform.rotation.y,
+            trans.transform.rotation.z,
+            trans.transform.rotation.w)[2]  # Extracting yaw (theta) from quaternion
+            print("Odom wrt base transform success")
+            self.current_pose = np.array([self.x, self.y, self.yaw])
+            return None
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            print("Couldn't get 'odom' wrt 'base'")
+            return None
+    """
+    Human position receiver
+    """        
+    def human_detect(self, data):
+        self.human_data = data
+        self.human_detected = True
+        #print(data.agent_states[0].pose.position.x)
+        #print(len(data.agent_states))
+""" EOF Controller Class """
+
+
+
+"""
+Main function
+Start the ros node
+Start the controller instance.
+"""
+if __name__ == '__main__':
+    rospy.init_node('my_controller', anonymous=True)
+    my_controller()
+    rospy.spin()
